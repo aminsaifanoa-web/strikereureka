@@ -1120,7 +1120,10 @@ def _search_root(board, deadline, max_depth):
             best_cand = best
             # wide net on coarse bounds, then verify exactly (cap cost).
             # Search-best goes first so scarce time verifies it first; if
-            # the clock is already gone, verify nothing else.
+            # the main search already spent the whole budget, skip
+            # verification entirely and keep search-best. Verification is
+            # a luxury for leftover time, never an overdraft — spending
+            # past deadline every move causes late-game time scrambles.
             prelim = [u for u, s in root_scores.items()
                       if s >= best_score - 60 and s > -8000 and u in by_uci
                       and u != best]
@@ -1128,7 +1131,7 @@ def _search_root(board, deadline, max_depth):
                         reverse=True)
             prelim = [best] + prelim
             if time.monotonic() >= deadline:
-                prelim = prelim[:1]
+                prelim = []
             verified = {}
             # vdepth + quiescence exposes refutations, which is all the
             # coarse PVS bounds can hide. Depth 2 (opponent's best reply
@@ -1139,7 +1142,7 @@ def _search_root(board, deadline, max_depth):
                 vdepth = 2 if time.monotonic() < deadline - 0.4 else 1
             except Exception:
                 vdepth = 1
-            for u in prelim[:8]:
+            for u in prelim[:6]:
                 m = by_uci[u]
                 board.push(m)
                 try:
