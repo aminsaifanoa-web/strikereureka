@@ -986,15 +986,95 @@ def _search_root(board, deadline, max_depth):
     # capped `sol`, and both sit far below the verified score (counts 20x),
     # so they only break genuine near-ties; the rest falls back to search
     # order (principled), never to anything arbitrary.
+    # Super-Capablanca finish: PVS null-window bounds are coarse — several
+    # moves can share the same bound while their true scores differ by
+    # hundreds. So first VERIFY the near-leaders with a full-window
+    # re-search (cheap at low depth, and 1-ply refutations show up
+    # immediately), then among truly near-equal moves bank forcing moves
+    # first — castle > capture/check > quiet — then the most prophylactically
+    # solid (development, pawn pressure, genuine hangs). `force` outranks
+    # capped `sol`, and both sit far below the verified score (counts 20x),
+    # so they only break genuine near-ties. The search-best is always an
+    # eligible winner (seeded first): verification can only dethrone it
+    # with a strictly better verified key, never by timeout attrition.
+    def _force_sol(u):
+        m = by_uci.get(u)
+        if m is None:
+            return 0, 0
+        # forcing moves first: a proven tactic banked now never
+        # evaporates over the horizon; threatening it again next
+        # move is strictly worse. `force` outranks `sol` so a
+        # lingering threat bonus can never beat the capture.
+        force = 0
+        if board.is_castling(m):
+            force = 60
+        elif board.is_capture(m):
+            force = 50
+        else:
+            try:
+                board.push(m)
+                gave_check = board.is_check()
+                board.pop()
+                if gave_check:
+                    force = 50
+            except Exception:
+                try:
+                    board.pop()
+                except Exception:
+                    pass
+        sol = 0
+        try:
+            pc = board.piece_at(m.from_square)
+            if pc is not None and pc.piece_type in (chess.KNIGHT, chess.BISHOP):
+                home = 0 if board.turn == chess.WHITE else 7
+                if chess.square_rank(m.from_square) == home:
+                    sol += 10
+            # knights belong in the center, never on the rim:
+            # Na6/Nh6-style moves lost us a rated game.
+            if pc is not None and pc.piece_type == chess.KNIGHT:
+                tf = chess.square_file(m.to_square)
+                if tf == 0 or tf == 7:
+                    sol -= 12
+                elif 2 <= tf <= 5:
+                    sol += 6
+        except Exception:
+            pass
+        try:
+            board.push(m)
+            sol += _slow_solidity(board)
+            board.pop()
+        except Exception:
+            try:
+                board.pop()
+            except Exception:
+                pass
+        if sol > 25:
+            sol = 25
+        elif sol < -25:
+            sol = -25
+        return force, sol
+
     try:
         if root_scores and abs(best_score) < MATE - 100:
             by_uci = {m.uci(): m for m in legal}
             order_idx = {m.uci(): i for i, m in enumerate(ordered)}
-            # wide net on coarse bounds, then verify exactly (cap cost)
+            # seed the decision with the search-best itself: verification
+            # may only replace it with something strictly better.
+            _bf, _bs = _force_sol(best)
+            best_key = (root_scores.get(best, best_score) * 20 + _bf + _bs,
+                        -order_idx.get(best, 999))
+            best_cand = best
+            # wide net on coarse bounds, then verify exactly (cap cost).
+            # Search-best goes first so scarce time verifies it first; if
+            # the clock is already gone, verify nothing else.
             prelim = [u for u, s in root_scores.items()
-                      if s >= best_score - 60 and s > -8000 and u in by_uci]
+                      if s >= best_score - 60 and s > -8000 and u in by_uci
+                      and u != best]
             prelim.sort(key=lambda u: (root_scores[u], -order_idx.get(u, 999)),
                         reverse=True)
+            prelim = [best] + prelim
+            if time.monotonic() >= deadline:
+                prelim = prelim[:1]
             verified = {}
             # vdepth=1 + quiescence: exposes 1-ply refutations (hanging
             # pieces), which is all the coarse PVS bounds can hide, at a
@@ -1028,65 +1108,12 @@ def _search_root(board, deadline, max_depth):
             if verified:
                 vbest = max(verified.values())
                 cands = [u for u, s in verified.items() if s >= vbest - 4]
-                best_key = None
-                best_cand = best
                 for u in cands:
-                    m = by_uci.get(u)
-                    if m is None:
+                    if u == best_cand and u == best:
                         continue
-                    # forcing moves first: a proven tactic banked now never
-                    # evaporates over the horizon; threatening it again next
-                    # move is strictly worse. `force` outranks `sol` so a
-                    # lingering threat bonus can never beat the capture.
-                    force = 0
-                    if board.is_castling(m):
-                        force = 60
-                    elif board.is_capture(m):
-                        force = 50
-                    else:
-                        try:
-                            board.push(m)
-                            gave_check = board.is_check()
-                            board.pop()
-                            if gave_check:
-                                force = 50
-                        except Exception:
-                            try:
-                                board.pop()
-                            except Exception:
-                                pass
-                    sol = 0
-                    try:
-                        pc = board.piece_at(m.from_square)
-                        if pc is not None and pc.piece_type in (chess.KNIGHT, chess.BISHOP):
-                            home = 0 if board.turn == chess.WHITE else 7
-                            if chess.square_rank(m.from_square) == home:
-                                sol += 10
-                        # knights belong in the center, never on the rim:
-                        # Na6/Nh6-style moves lost us a rated game.
-                        if pc is not None and pc.piece_type == chess.KNIGHT:
-                            tf = chess.square_file(m.to_square)
-                            if tf == 0 or tf == 7:
-                                sol -= 12
-                            elif 2 <= tf <= 5:
-                                sol += 6
-                    except Exception:
-                        pass
-                    try:
-                        board.push(m)
-                        sol += _slow_solidity(board)
-                        board.pop()
-                    except Exception:
-                        try:
-                            board.pop()
-                        except Exception:
-                            pass
-                    if sol > 25:
-                        sol = 25
-                    elif sol < -25:
-                        sol = -25
+                    force, sol = _force_sol(u)
                     key = (verified[u] * 20 + force + sol, -order_idx.get(u, 999))
-                    if best_key is None or key > best_key:
+                    if key > best_key:
                         best_key = key
                         best_cand = u
                 if best_cand != best:
