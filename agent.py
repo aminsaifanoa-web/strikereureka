@@ -521,7 +521,7 @@ def _slow_solidity(board):
     Preemptive defense counts genuine hangs: our pieces hit by the enemy
     and uncovered by us, plus real enemy pawn pressure on our king.
     Called only at root among near-equal moves (a handful of positions), so
-    attacker maps here cost nothing. Bounded to roughly [-120, +120].
+    attacker maps here cost nothing. Bounded to roughly [-150, +150].
     """
     try:
         me = not board.turn   # side that just moved (us)
@@ -562,14 +562,58 @@ def _slow_solidity(board):
                 score += sum(10 for s in zone if _pawn_attacks_square(board, s, me))
         except Exception:
             pass
-        return max(-120, min(120, score))
+        # multiple simultaneous threats: an enemy piece hit twice by us
+        # and uncovered by them is about to be won — bank the initiative.
+        try:
+            for sq, pc in board.piece_map().items():
+                if pc.color == me or pc.piece_type not in (
+                        chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+                    continue
+                try:
+                    n_atk = len(board.attackers(me, sq))
+                except Exception:
+                    n_atk = 0
+                if n_atk >= 2 and not board.is_attacked_by(opp, sq):
+                    score += 30
+        except Exception:
+            pass
+        return max(-150, min(150, score))
+    except Exception:
+        return 0
+
+
+def _hang_penalty(board, arr):
+    """Predict the opponent's pawn takes, every node, both colours.
+
+    Any N/B/R/Q attacked by an enemy pawn and undefended by its own side
+    is hanging: the take is forcing and nearly always played. Pawn attacks
+    are exact (two square lookups), so this never invents phantoms, and it
+    costs almost nothing when nothing is attacked (the common case).
+    White perspective; bounded to roughly [-160, +160].
+    """
+    try:
+        adj = 0
+        # piece values for the hanging test: index by abs(piece)
+        hang = (0, 0, 25, 25, 35, 50, 0)
+        for sq in np.where((arr >= 2) & (arr <= 5))[0]:
+            sqi = int(sq)
+            if _pawn_attacks_square(board, sqi, chess.BLACK):
+                if not board.is_attacked_by(chess.WHITE, sqi):
+                    adj -= hang[int(arr[sqi])]
+        for sq in np.where((arr >= -5) & (arr <= -2))[0]:
+            sqi = int(sq)
+            if _pawn_attacks_square(board, sqi, chess.WHITE):
+                if not board.is_attacked_by(chess.BLACK, sqi):
+                    adj += hang[int(-arr[sqi])]
+        return max(-160, min(160, adj))
     except Exception:
         return 0
 
 
 def _static_score(board, arr_cache):
     """Centipawns from side-to-move perspective (Capablanca-steered)."""
-    s = _eval_board_array(arr_cache) + _capa_fast_adjust(board, arr_cache)
+    s = (_eval_board_array(arr_cache) + _capa_fast_adjust(board, arr_cache)
+         + _hang_penalty(board, arr_cache))
     if board.turn == chess.BLACK:
         s = -s
     # tempo bonus for side to move
@@ -638,6 +682,16 @@ def _ordered_moves(board, moves, tt_move_uci, ply):
         tfile, trank = chess.square_file(to), chess.square_rank(to)
         if 2 <= tfile <= 5 and 2 <= trank <= 5:
             bonus += 120
+        # forcing moves first at the root only (ply 0): checks earn a
+        # full-window search first, which is where tactics are proven.
+        # Interior nodes skip this (gives_check costs time, ordering
+        # there only affects speed, never correctness).
+        if ply == 0:
+            try:
+                if board.gives_check(m):
+                    bonus += 3000
+            except Exception:
+                pass
         try:
             pc = board.piece_at(m.from_square)
             if pc is not None and pc.piece_type in (chess.KNIGHT, chess.BISHOP):
@@ -1076,11 +1130,15 @@ def _search_root(board, deadline, max_depth):
             if time.monotonic() >= deadline:
                 prelim = prelim[:1]
             verified = {}
-            # vdepth=1 + quiescence: exposes 1-ply refutations (hanging
-            # pieces), which is all the coarse PVS bounds can hide, at a
-            # few ms per candidate. Deeper tactics were already settled by
-            # the main search.
-            vdepth = 1
+            # vdepth + quiescence exposes refutations, which is all the
+            # coarse PVS bounds can hide. Depth 2 (opponent's best reply
+            # plus our answer) when clock remains, depth 1 when tight:
+            # disproof of blunders when affordable, never at flag risk.
+            # Deeper tactics were already settled by the main search.
+            try:
+                vdepth = 2 if time.monotonic() < deadline - 0.4 else 1
+            except Exception:
+                vdepth = 1
             for u in prelim[:8]:
                 m = by_uci[u]
                 board.push(m)
