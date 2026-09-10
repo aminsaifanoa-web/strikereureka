@@ -644,6 +644,14 @@ def _ordered_moves(board, moves, tt_move_uci, ply):
                 home = 0 if board.turn == chess.WHITE else 7
                 if chess.square_rank(m.from_square) == home:
                     bonus += 200  # develop a new piece
+            # knights toward the center (ordering only affects speed, but
+            # central moves cut off more, so they buy real depth)
+            if pc is not None and pc.piece_type == chess.KNIGHT:
+                tf = chess.square_file(m.to_square)
+                if tf == 0 or tf == 7:
+                    bonus -= 400
+                elif 2 <= tf <= 5:
+                    bonus += 100
         except Exception:
             pass
         # preemptive defense: never loosen the king's pawn shield cheaply
@@ -1054,6 +1062,14 @@ def _search_root(board, deadline, max_depth):
                             home = 0 if board.turn == chess.WHITE else 7
                             if chess.square_rank(m.from_square) == home:
                                 sol += 10
+                        # knights belong in the center, never on the rim:
+                        # Na6/Nh6-style moves lost us a rated game.
+                        if pc is not None and pc.piece_type == chess.KNIGHT:
+                            tf = chess.square_file(m.to_square)
+                            if tf == 0 or tf == 7:
+                                sol -= 12
+                            elif 2 <= tf <= 5:
+                                sol += 6
                     except Exception:
                         pass
                     try:
